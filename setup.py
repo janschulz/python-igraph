@@ -14,6 +14,13 @@ if sys.version_info < (2, 5):
     print("This module requires Python >= 2.5")
     sys.exit(0)
 
+if sys.version_info < (3, 0):
+    PY27 = True
+else:
+    PY27 = False
+
+IS_64BIT = (sys.maxsize > 2 ** 32)
+
 # Check whether we are running inside tox -- if so, we will use a non-logging
 # URL to download the C core of igraph to avoid inflating download counts
 TESTING_IN_TOX = "TESTING_IN_TOX" in os.environ
@@ -191,6 +198,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 import tempfile
 
 from select import select
@@ -417,14 +425,13 @@ class IgraphCCoreBuilder(object):
             self.version, remote_url = self.find_first_version()
             if not self.version:
                 print("Version %s of the C core of igraph is not found among the "
-                        "nightly builds." % self.versions_to_try[0])
+                      "nightly builds." % self.versions_to_try[0])
                 print("Use the --c-core-version switch to try a different version.")
                 print("")
                 return False
-            local_file = "igraph-%s.tar.gz" % self.version
         else:
             remote_url = self.remote_url
-            local_file = remote_url.rsplit("/", 1)[1]
+        local_file = remote_url.rsplit("/", 1)[1]
 
         print("Using temporary directory: %s" % self.tmpdir)
 
@@ -445,8 +452,10 @@ class IgraphCCoreBuilder(object):
             archive = tarfile.open(local_file_full_path, "r:gz")
         elif local_file.lower().endswith(".tar.bz2"):
             archive = tarfile.open(local_file_full_path, "r:bz2")
+        elif local_file.lower().endswith(".zip"):
+            archive = zipfile.ZipFile(local_file_full_path)
         else:
-            print("Cannot extract unknown archive format: %s." % ext)
+            print("Cannot extract unknown archive format: %s." % local_file)
             print("")
             return False
         archive.extractall(self.tmpdir)
@@ -461,8 +470,111 @@ class IgraphCCoreBuilder(object):
 
         if not self.builddir:
             print("Downloaded tarball did not contain a directory whose name "
-                    "started with igraph; giving up build.")
+                  "started with igraph; giving up build.")
             return False
+
+        if is_unix_like():
+            libraries = self.compile_unix()
+        else:
+            libraries = self.compile_windows()
+
+        if not libraries:
+            return False
+
+        # Compilation succeeded; copy everything into igraphcore
+        create_dir_unless_exists("igraphcore")
+        ensure_dir_does_not_exist("igraphcore", "include")
+        ensure_dir_does_not_exist("igraphcore", "lib")
+        shutil.copytree(os.path.join(self.builddir, "include"),
+                        os.path.join("igraphcore", "include"))
+        shutil.copytree(os.path.join(self.builddir, "src", ".libs"),
+                        os.path.join("igraphcore", "lib"))
+        f = open(os.path.join("igraphcore", "build.cfg"), "w")
+        f.write(repr(libraries))
+        f.close()
+
+        return True
+
+    def compile_windows(self):
+        """Compiles the C core of igraph on windows."""
+
+        # Try to compile
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.builddir)
+
+            # steps:
+            # * update the build files for the current msvc version
+            # * run the build script
+            from distutils import msvccompiler
+            msvc = msvccompiler.MSVCCompiler(verbose=True)
+            msvc.initialize()
+
+            bits = "x64" if IS_64BIT else "win32"
+            if PY27:
+                cmd = msvc.find_exe("vcbuild.exe")
+                args = [cmd, '/upgrade']
+                try:
+                    subprocess.check_call(args, stdout=sys.stdout, stderr=sys.stderr)
+                except:
+                    print("Call failed: %s" % args)
+                    return False
+
+                args = [cmd, 'igraph.vcproj', 'release|%s' % bits]
+                try:
+                    subprocess.check_call(args, stdout=sys.stdout, stderr=sys.stderr)
+                except:
+                    print("Call failed: %s" % args)
+                    return False
+
+            else:
+                try:
+                    cmd = msvc.find_exe("VCUpgrade.exe")
+                    args = [cmd, '/overwrite', 'igraph.vcproj']
+                    try:
+                        subprocess.check_call(args, stdout=sys.stdout, stderr=sys.stderr)
+                    except Exception as e:
+                        print("Call failed: %s" % args)
+                        print("Trying alternative...")
+                        raise e
+                except:
+                    cmd = msvc.find_exe("devenv.exe")
+                    args = [cmd, '/Upgrade', 'igraph.sln']
+                    print("Running: %s" % args)
+                    try:
+                        subprocess.check_call(args, stdout=sys.stdout, stderr=sys.stderr)
+                    except:
+                        print("Call failed: %s" % args)
+                        return False
+
+                cmd = msvc.find_exe("msbuild.exe")
+                args = [cmd, 'igraph.vcxproj']
+                try:
+                    subprocess.check_call(args, stdout=sys.stdout, stderr=sys.stderr)
+                except:
+                    print("Call failed: %s" % args)
+                    return False
+
+            # can't go further right now :-(
+            return False
+
+
+            libraries = []
+            for line in open(os.path.join(self.builddir, "igraph.pc")):
+                if line.startswith("Libs: ") or line.startswith("Libs.private: "):
+                    words = line.strip().split()
+                    libraries.extend(word[2:] for word in words if word.startswith("-l"))
+
+            if not libraries:
+                # Educated guess
+                libraries = ["igraph"]
+
+        finally:
+            os.chdir(cwd)
+        return libraries
+
+    def compile_unix(self):
+        """Compiles the C core of igraph on unix."""
 
         # Try to compile
         cwd = os.getcwd()
@@ -510,20 +622,7 @@ class IgraphCCoreBuilder(object):
 
         finally:
             os.chdir(cwd)
-
-        # Compilation succeeded; copy everything into igraphcore
-        create_dir_unless_exists("igraphcore")
-        ensure_dir_does_not_exist("igraphcore", "include")
-        ensure_dir_does_not_exist("igraphcore", "lib")
-        shutil.copytree(os.path.join(self.builddir, "include"),
-                os.path.join("igraphcore", "include"))
-        shutil.copytree(os.path.join(self.builddir, "src", ".libs"),
-                os.path.join("igraphcore", "lib"))
-        f = open(os.path.join("igraphcore", "build.cfg"), "w")
-        f.write(repr(libraries))
-        f.close()
-
-        return True
+        return libraries
 
     def find_first_version(self):
         """Finds the first version of igraph that exists in the nightly build
@@ -535,12 +634,22 @@ class IgraphCCoreBuilder(object):
         return None, None
 
     def get_download_url(self, version):
+
+        if is_unix_like():
+            flavor = "c"
+            postfix = ".tar.gz"
+        else:
+            flavor = "msvc"
+            postfix = "-msvc.zip"
+
         if TESTING_IN_TOX:
             # Make sure that tox unit tests are not counted as real
             # igraph downloads
-            return "http://igraph.org/nightly/steal/c/igraph-%s.tar.gz" % version
+            method = "steal"
         else:
-            return "http://igraph.org/nightly/get/c/igraph-%s.tar.gz" % version
+            method = "get"
+        templ = "http://igraph.org/nightly/%s/%s/igraph-%s%s"
+        return templ % (method, flavor, version, postfix)
 
     def run(self):
         return self.download_and_compile()
@@ -617,7 +726,7 @@ class BuildConfiguration(object):
                 # Download and compile igraph if the user did not disable it and
                 # we do not know the libraries from pkg-config yet
                 if not detected:
-                    if buildcfg.download_igraph_if_needed and is_unix_like():
+                    if buildcfg.download_igraph_if_needed:
                         detected = buildcfg.download_and_compile_igraph()
                         if detected:
                             buildcfg.use_built_igraph()
@@ -803,7 +912,7 @@ class BuildConfiguration(object):
 
         print("WARNING: we were not able to detect where igraph is installed on")
         print("your machine (if it is installed at all). We will use the fallback")
-        print("library and include pathss hardcoded in setup.py and hope that the")
+        print("library and include paths hardcoded in setup.py and hope that the")
         print("C core of igraph is installed there.")
         print("")
         print("If the compilation fails and you are sure that igraph is installed")
@@ -814,24 +923,25 @@ class BuildConfiguration(object):
         print("- LIBIGRAPH_FALLBACK_LIBRARY_DIRS")
         print("")
 
-        seconds_remaining = 10 if self.wait else 0
-        while seconds_remaining > 0:
-            if seconds_remaining > 1:
-                plural = "s"
-            else:
-                plural = ""
+        if is_unix_like():
+            seconds_remaining = 10 if self.wait else 0
+            while seconds_remaining > 0:
+                if seconds_remaining > 1:
+                    plural = "s"
+                else:
+                    plural = ""
 
-            sys.stdout.write("\rContinuing in %2d second%s; press Enter to continue "
-                    "immediately. " % (seconds_remaining, plural))
-            sys.stdout.flush()
+                sys.stdout.write("\rContinuing in %2d second%s; press Enter to continue "
+                        "immediately. " % (seconds_remaining, plural))
+                sys.stdout.flush()
 
-            rlist, _, _ = select([sys.stdin], [], [], 1)
-            if rlist:
-                sys.stdin.readline()
-                break
+                rlist, _, _ = select([sys.stdin], [], [], 1)
+                if rlist:
+                    sys.stdin.readline()
+                    break
 
-            seconds_remaining -= 1
-        sys.stdout.write("\r" + " "*65 + "\r")
+                seconds_remaining -= 1
+            sys.stdout.write("\r" + " "*65 + "\r")
 
         self.libraries = LIBIGRAPH_FALLBACK_LIBRARIES[:]
         if self.static_extension:
